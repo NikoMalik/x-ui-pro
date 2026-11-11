@@ -34,6 +34,21 @@ bash <(wget -qO- https://github.com/NikoMalik/x-ui-pro/raw/master/x-ui-pro.sh) -
 > 
 > Do not change SubDomain for renew SSL❗ To move to a new subdomain use the patch below
 
+**Install without Clash** (only for v2ray/xray/sing-box clients like Happ, OneXray, v2rayN, Hiddify)
+```
+bash <(wget -qO- https://github.com/NikoMalik/x-ui-pro/raw/master/x-ui-pro.sh) -install yes -clash no
+```
+
+| option | values |
+|---|---|
+| `-install` | `yes` install packages, needed on a clean server |
+| `-subdomain` | panel domain, asked if not set |
+| `-reality_domain` | REALITY domain, asked if not set |
+| `-websub` | `0` modern sub page, `1` classic |
+| `-clash` | `0` ru-bundle, `1` skrepysh, `2` full proxy except RU, `3` re-filter ECH, `no` skip Clash template |
+| `-auto_domain` | `y` use `IP.cdn-one.org` domains |
+| `-uninstall` | `yes` remove everything |
+
 
 **Uninstall X-UI-PRO**:x:
 ```

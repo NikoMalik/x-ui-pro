@@ -1107,14 +1107,18 @@ DEST_FILE_CLASH_SUB="$DEST_DIR_SUB_PAGE/clash.yaml"
 
 sudo mkdir -p "$DEST_DIR_SUB_PAGE"
 
-sudo curl -L "${URL_CLASH_SUB[$CLASH]}" -o "$DEST_FILE_CLASH_SUB"
+if [[ "$CLASH" =~ ^[0-3]$ ]]; then
+	sudo curl -L "${URL_CLASH_SUB[$CLASH]}" -o "$DEST_FILE_CLASH_SUB"
+	sed -i "s/\${DOMAIN}/$domain/g" "$DEST_FILE_CLASH_SUB"
+	sed -i "s#\${SUB_PATH}#$sub_path#g" "$DEST_FILE_CLASH_SUB"
+else
+	rm -f "$DEST_FILE_CLASH_SUB"
+fi
 sudo curl -L "${URL_SUB_PAGE[$CUSTOMWEBSUB]}" -o "$DEST_FILE_SUB_PAGE"
 
 sed -i "s/\${DOMAIN}/$domain/g" "$DEST_FILE_SUB_PAGE"
-sed -i "s/\${DOMAIN}/$domain/g" "$DEST_FILE_CLASH_SUB"
 sed -i "s#\${SUB_JSON_PATH}#$json_path#g" "$DEST_FILE_SUB_PAGE"
 sed -i "s#\${SUB_PATH}#$sub_path#g" "$DEST_FILE_SUB_PAGE"
-sed -i "s#\${SUB_PATH}#$sub_path#g" "$DEST_FILE_CLASH_SUB"
 sed -i "s|sub.legiz.ru|$domain/$sub2singbox_path|g" "$DEST_FILE_SUB_PAGE"
 
 #while true; do	

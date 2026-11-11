@@ -7,6 +7,7 @@ reality fingerprint chrome instead of random
 certbot cron renews with standalone and stops nginx for the renewal
 add patch_old.sh to move an install to a new panel subdomain
 add xui-tools.sh server helper
+-clash no skips the Clash template
 v0.3
 add emoji flag vps country to inbound remarks
 for clash meta config with re-filter ECH+noECH rules use option: -clash 3
