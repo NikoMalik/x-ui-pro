@@ -256,6 +256,8 @@ server {
     listen          443;
     proxy_pass      \$sni_name;
     ssl_preread     on;
+    proxy_timeout   1h;
+    proxy_connect_timeout 5s;
 }
 
 EOF
@@ -263,8 +265,26 @@ EOF
 grep -xqFR "stream { include /etc/nginx/stream-enabled/*.conf; }" /etc/nginx/* ||echo "stream { include /etc/nginx/stream-enabled/*.conf; }" >> /etc/nginx/nginx.conf
 grep -xqFR "load_module modules/ngx_stream_module.so;" /etc/nginx/* || sed -i '1s/^/load_module \/usr\/lib\/nginx\/modules\/ngx_stream_module.so; /' /etc/nginx/nginx.conf
 grep -xqFR "load_module modules/ngx_stream_geoip2_module.so;" /etc/nginx* || sed -i '2s/^/load_module \/usr\/lib\/nginx\/modules\/ngx_stream_geoip2_module.so; /' /etc/nginx/nginx.conf
-grep -xqFR "worker_rlimit_nofile 16384;" /etc/nginx/* ||echo "worker_rlimit_nofile 16384;" >> /etc/nginx/nginx.conf
-sed -i "/worker_connections/c\worker_connections 4096;" /etc/nginx/nginx.conf
+sed -i '/^\s*worker_rlimit_nofile/d; /^\s*worker_shutdown_timeout/d; /^\s*multi_accept/d; /^\s*use epoll/d' /etc/nginx/nginx.conf
+sed -i "/worker_connections/c\    worker_connections 16384;\n    multi_accept on;\n    use epoll;" /etc/nginx/nginx.conf
+echo "worker_rlimit_nofile 200000;" >> /etc/nginx/nginx.conf
+echo "worker_shutdown_timeout 30s;" >> /etc/nginx/nginx.conf
+mkdir -p /etc/nginx/conf.d
+: > /etc/nginx/conf.d/xui-tuning.conf
+while read -r name value; do
+	grep -qE "^\s*${name}\s" /etc/nginx/nginx.conf || echo "${name} ${value};" >> /etc/nginx/conf.d/xui-tuning.conf
+done <<'EOF'
+server_tokens off
+keepalive_requests 100000
+http2_max_concurrent_streams 512
+ssl_session_cache shared:SSL:20m
+ssl_session_timeout 1d
+ssl_session_tickets off
+open_file_cache max=200000 inactive=20s
+open_file_cache_valid 30s
+open_file_cache_min_uses 2
+open_file_cache_errors on
+EOF
 cat > "/etc/nginx/sites-available/80.conf" << EOF
 server {
     listen 80;
@@ -286,6 +306,9 @@ server {
 	ssl_ciphers HIGH:!aNULL:!eNULL:!MD5:!DES:!RC4:!ADH:!SSLv3:!EXP:!PSK:!DSS;
 	ssl_certificate /etc/letsencrypt/live/$domain/fullchain.pem;
 	ssl_certificate_key /etc/letsencrypt/live/$domain/privkey.pem;
+	real_ip_header proxy_protocol;
+	set_real_ip_from 127.0.0.1;
+	absolute_redirect off;
 	if (\$host !~* ^(.+\.)?$domain\$ ){return 444;}
 	if (\$scheme ~* https) {set \$safe 1;}
 	if (\$ssl_server_name !~* ^(.+\.)?$domain\$ ) {set \$safe "\${safe}0"; }
@@ -433,8 +456,10 @@ cat > "/etc/nginx/snippets/includes.conf" << EOF
 		client_max_body_size 0;
 		client_body_timeout 1d;
 		grpc_read_timeout 1d;
+		grpc_send_timeout 1d;
 		grpc_socket_keepalive on;
 		proxy_read_timeout 1d;
+		proxy_send_timeout 1d;
 		proxy_http_version 1.1;
 		proxy_buffering off;
 		proxy_request_buffering off;
@@ -648,7 +673,7 @@ if [[ -f $XUIDB ]]; then
     ],
     "settings": {
       "publicKey": "${public_key}",
-      "fingerprint": "random",
+      "fingerprint": "chrome",
       "serverName": "",
       "spiderX": "/"
     }
@@ -1105,7 +1130,7 @@ sed -i "s|sub.legiz.ru|$domain/$sub2singbox_path|g" "$DEST_FILE_SUB_PAGE"
 crontab -l | grep -v "certbot\|x-ui\|cloudflareips" | crontab -
 (crontab -l 2>/dev/null; echo '@reboot /usr/bin/sub2sing-box server --bind 127.0.0.1 --port 8080 > /dev/null 2>&1') | crontab -
 (crontab -l 2>/dev/null; echo '@daily x-ui restart > /dev/null 2>&1 && nginx -s reload;') | crontab -
-(crontab -l 2>/dev/null; echo '@monthly certbot renew --nginx --non-interactive --post-hook "nginx -s reload" > /dev/null 2>&1;') | crontab -
+(crontab -l 2>/dev/null; echo '@monthly certbot renew --non-interactive --pre-hook "systemctl stop nginx" --post-hook "systemctl start nginx" > /dev/null 2>&1') | crontab -
 ##################################ufw###################################################################
 ufw disable
 ufw allow 22/tcp
