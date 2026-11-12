@@ -3,11 +3,17 @@ nginx: worker_connections 16384, multi_accept, epoll, worker_rlimit_nofile 20000
 nginx: conf.d/xui-tuning.conf with keepalive_requests, http2_max_concurrent_streams, ssl session cache, server_tokens off, open_file_cache
 nginx: stream proxy_timeout 1h and proxy_connect_timeout 5s, grpc/proxy send timeout 1d
 nginx: real client IP from proxy_protocol and absolute_redirect off on panel vhost
+sysctl: /etc/sysctl.d/90-xui.conf and 91-xui-conntrack.conf instead of appending to sysctl.conf, bigger buffers, mtu probing, conntrack 2h, nf_conntrack loaded at boot
 reality fingerprint chrome instead of random
 certbot cron renews with standalone and stops nginx for the renewal
-add patch_old.sh to move an install to a new panel subdomain
+add patch_old.sh to move an install to a new panel subdomain, -reality_domain also moves the REALITY domain
+add relay_setup.sh for a forwarding server (tcp/udp 443 and tcp 80) and xui-tools relay/cfip host copies
+add xui-tools alias for an extra site and subscription name, e.g. pointing to a relay
 add xui-tools.sh server helper
 -clash no skips the Clash template
+add Hysteria2 inbound on UDP 443 with salamander obfs and REALITY domain cert, client firstH, skip with -hysteria n
+add patch_hysteria.sh to add or fix Hysteria2 on an existing install
+installer: let 3x-ui 3.x import clients and hosts written by the script on first start
 v0.3
 add emoji flag vps country to inbound remarks
 for clash meta config with re-filter ECH+noECH rules use option: -clash 3

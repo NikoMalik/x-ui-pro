@@ -9,7 +9,7 @@ echo;msg_inf '           ___    _   _   _  '	;
 msg_inf		 ' \/ __ | |  | __ |_) |_) / \ '	;
 msg_inf		 ' /\    |_| _|_   |   | \ \_/ '	; echo
 ##################################Variables#############################################################
-XUIDB="/etc/x-ui/x-ui.db";domain="";UNINSTALL="x";INSTALL="n";PNLNUM=1;CFALLOW="n";CLASH=0;CUSTOMWEBSUB=0
+XUIDB="/etc/x-ui/x-ui.db";domain="";UNINSTALL="x";INSTALL="n";PNLNUM=1;CFALLOW="n";CLASH=0;CUSTOMWEBSUB=0;HYSTERIA="y"
 Pak=$(type apt &>/dev/null && echo "apt" || echo "yum")
 systemctl stop x-ui
 rm -rf /etc/systemd/system/x-ui.service
@@ -83,6 +83,7 @@ while [ "$#" -gt 0 ]; do
     -ONLY_CF_IP_ALLOW) CFALLOW="$2"; shift 2;;
     -websub) CUSTOMWEBSUB="$2"; shift 2;;
     -clash) CLASH="$2"; shift 2;;
+    -hysteria) HYSTERIA="$2"; shift 2;;
     -uninstall) UNINSTALL="$2"; shift 2;;
     *) shift 1;;
   esac
@@ -904,6 +905,81 @@ if [[ -f $XUIDB ]]; then
 }'
 	);
 EOF
+if [[ ${HYSTERIA} == *"y"* ]]; then
+	hy_auth=$(gen_random_string 16)
+	hy_obfs=$(gen_random_string 16)
+	sqlite3 $XUIDB <<EOF
+	INSERT INTO "client_traffics" ("inbound_id","enable","email","up","down","expiry_time","total","reset") VALUES ('5','1','firstH','0','0','0','0','0');
+	INSERT INTO "inbounds" ("user_id","up","down","total","remark","enable","expiry_time","listen","port","protocol","settings","stream_settings","tag","sniffing") VALUES (
+	'1','0','0','0','${emoji_flag} hysteria2','1','0','','443','hysteria',
+	'{
+  "version": 2,
+  "clients": [
+    {
+      "email": "firstH",
+      "auth": "${hy_auth}",
+      "limitIp": 0,
+      "totalGB": 0,
+      "expiryTime": 0,
+      "enable": true,
+      "tgId": "",
+      "subId": "first",
+      "reset": 0,
+      "created_at": 1756726925000,
+      "updated_at": 1756726925000
+    }
+  ]
+}',
+	'{
+  "network": "hysteria",
+  "security": "tls",
+  "externalProxy": [
+    {
+      "forceTls": "same",
+      "dest": "${IP4}",
+      "port": 443,
+      "remark": ""
+    }
+  ],
+  "hysteriaSettings": {
+    "version": 2
+  },
+  "tlsSettings": {
+    "serverName": "${reality_domain}",
+    "alpn": ["h3"],
+    "certificates": [
+      {
+        "certificateFile": "/etc/letsencrypt/live/${reality_domain}/fullchain.pem",
+        "keyFile": "/etc/letsencrypt/live/${reality_domain}/privkey.pem"
+      }
+    ]
+  },
+  "finalmask": {
+    "udp": [
+      {
+        "type": "salamander",
+        "settings": {
+          "password": "${hy_obfs}"
+        }
+      }
+    ]
+  }
+}',
+	'inbound-443-udp',
+	'{
+  "enabled": true,
+  "destOverride": [
+    "http",
+    "tls",
+    "quic"
+  ],
+  "metadataOnly": false,
+  "routeOnly": false
+}'
+	);
+EOF
+fi
+sqlite3 $XUIDB "DELETE FROM history_of_seeders WHERE seeder_name IN ('ClientsTable','HostsFromExternalProxy');" 2>/dev/null
 /usr/local/x-ui/x-ui setting -username "${config_username}" -password "${config_password}" -port "${panel_port}" -webBasePath "${panel_path}"
 /usr/local/x-ui/x-ui cert -webCert "/root/cert/${domain}/fullchain.pem" -webCertKey "/root/cert/${domain}/privkey.pem"
 x-ui start
@@ -1056,18 +1132,38 @@ fi
 
 ######################enable bbr and tune system########################################################
 apt-get install -yqq --no-install-recommends ca-certificates
-echo "net.core.default_qdisc=fq" | tee -a /etc/sysctl.conf
-echo "net.ipv4.tcp_congestion_control=bbr" | tee -a /etc/sysctl.conf
-echo "fs.file-max=2097152" | tee -a /etc/sysctl.conf
-echo "net.ipv4.tcp_timestamps = 1" | tee -a /etc/sysctl.conf
-echo "net.ipv4.tcp_sack = 1" | tee -a /etc/sysctl.conf
-echo "net.ipv4.tcp_window_scaling = 1" | tee -a /etc/sysctl.conf
-echo "net.core.rmem_max = 16777216" | tee -a /etc/sysctl.conf
-echo "net.core.wmem_max = 16777216" | tee -a /etc/sysctl.conf
-echo "net.ipv4.tcp_rmem = 4096 87380 16777216" | tee -a /etc/sysctl.conf
-echo "net.ipv4.tcp_wmem = 4096 65536 16777216" | tee -a /etc/sysctl.conf
-
-sysctl -p
+cat > /etc/sysctl.d/90-xui.conf <<'EOF'
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+fs.file-max = 2097152
+net.ipv4.tcp_timestamps = 1
+net.ipv4.tcp_sack = 1
+net.ipv4.tcp_window_scaling = 1
+net.core.rmem_max = 67108864
+net.core.wmem_max = 67108864
+net.ipv4.tcp_rmem = 4096 131072 67108864
+net.ipv4.tcp_wmem = 4096 16384 67108864
+net.ipv4.tcp_notsent_lowat = 131072
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_syncookies = 1
+net.core.somaxconn = 65535
+net.core.netdev_max_backlog = 65536
+net.ipv4.tcp_max_syn_backlog = 16384
+net.ipv4.tcp_keepalive_time = 120
+net.ipv4.tcp_keepalive_intvl = 30
+net.ipv4.tcp_keepalive_probes = 3
+vm.swappiness = 20
+EOF
+modprobe nf_conntrack 2>/dev/null && echo nf_conntrack > /etc/modules-load.d/conntrack.conf
+cat > /etc/sysctl.d/91-xui-conntrack.conf <<'EOF'
+net.netfilter.nf_conntrack_max = 262144
+net.netfilter.nf_conntrack_tcp_timeout_established = 7200
+net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
+EOF
+sysctl --system >/dev/null
 
 
 ######################install_sub2sing-box#################################################################
@@ -1140,7 +1236,8 @@ ufw disable
 ufw allow 22/tcp
 ufw allow 80/tcp
 ufw allow 443/tcp
-ufw --force enable  
+[[ ${HYSTERIA} == *"y"* ]] && ufw allow 443/udp
+ufw --force enable
 ##################################Show Details##########################################################
 
 if systemctl is-active --quiet x-ui; then clear
@@ -1165,6 +1262,7 @@ if systemctl is-active --quiet x-ui; then clear
 	msg_inf "- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -"
     msg_inf "Web Sub Page your first client: https://${domain}/${web_path}?name=first\n"
     msg_inf "Your local sub2sing-box instance: https://${domain}/$sub2singbox_path/\n"
+    [[ ${HYSTERIA} == *"y"* ]] && msg_inf "Hysteria2: udp ${IP4}:443, sni ${reality_domain}, salamander obfs, client firstH in the same subscription\n"
   msg_inf "- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -"
 	msg_inf "Please Save this Screen!!"	
 else

@@ -157,10 +157,68 @@ cmd_backup() {
 	echo "restore: systemctl stop x-ui nginx; tar xzf $out -P -C /; systemctl start x-ui nginx"
 }
 
+autoban_paths() {
+	local inc=/etc/nginx/snippets/includes.conf
+	{
+		db_setting subPath
+		db_setting subJsonPath
+		db_setting webBasePath
+		grep -A1 '#XHTTP' "$inc" 2>/dev/null | grep -oP 'location /\K[A-Za-z0-9]+'
+		grep -oP 'location ~ \^/\K[A-Za-z0-9]+(?= \{)' "$inc" 2>/dev/null
+		awk '/location \//{l=$2} /proxy_pass http:\/\/127\.0\.0\.1:8080\//{gsub("/", "", l); print l; exit}' "$inc" 2>/dev/null
+	} | grep -E '^[A-Za-z0-9_-]+$' | sort -u | paste -sd'|'
+}
+
+cmd_autoban() {
+	local cf paths ign
+	case "$1" in
+	on)
+		command -v fail2ban-client &>/dev/null || DEBIAN_FRONTEND=noninteractive apt-get install -y -q fail2ban
+		cf="$(curl -fsS --max-time 10 https://www.cloudflare.com/ips-v4 | xargs) $(curl -fsS --max-time 10 https://www.cloudflare.com/ips-v6 | xargs)"
+		[[ "$cf" == *"/"* ]] || { echo "cannot fetch Cloudflare ranges, not enabling, it could ban Cloudflare and cut every CDN client"; exit 1; }
+		paths=$(autoban_paths)
+		ign='\d+/'
+		[[ -n "$paths" ]] && ign+="|(?:${paths})[/?\" ]"
+		cat > /etc/fail2ban/filter.d/xui-scan.conf <<EOF
+[Definition]
+failregex = ^<HOST> \S+ \S+ \[[^\]]*\] "[A-Z]+ [^"]*" (?:404|444)
+ignoreregex = ^\S+ \S+ \S+ \[[^\]]*\] "[A-Z]+ /(?:${ign})
+EOF
+		cat > /etc/fail2ban/jail.d/xui-scan.conf <<EOF
+[xui-scan]
+enabled = true
+filter = xui-scan
+logpath = /var/log/nginx/access.log
+backend = auto
+maxretry = ${XUI_AUTOBAN_HITS:-30}
+findtime = 10m
+bantime = ${XUI_AUTOBAN_TIME:-1d}
+banaction = ufw
+ignoreip = 127.0.0.1/8 ::1 $cf
+EOF
+		systemctl enable --now fail2ban >/dev/null 2>&1
+		fail2ban-client reload >/dev/null && echo "autoban on: ${XUI_AUTOBAN_HITS:-30} hits of 404/444 in 10m -> ban ${XUI_AUTOBAN_TIME:-1d}"
+		fail2ban-client status xui-scan
+		;;
+	off)
+		rm -f /etc/fail2ban/jail.d/xui-scan.conf /etc/fail2ban/filter.d/xui-scan.conf
+		fail2ban-client reload >/dev/null 2>&1
+		echo "autoban off, already banned IPs stay in ufw until you unban them"
+		;;
+	test)
+		fail2ban-regex /var/log/nginx/access.log /etc/fail2ban/filter.d/xui-scan.conf | sed -n '/^Lines:/p;/^Failregex:/p'
+		;;
+	*)
+		command -v fail2ban-client &>/dev/null && fail2ban-client status xui-scan 2>/dev/null || echo "autoban is off, enable: xui-tools autoban on"
+		;;
+	esac
+}
+
 valid_ip() { [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ || "$1" == *:* ]]; }
 
 cmd_ban() {
 	valid_ip "$1" || { echo "usage: xui-tools ban <ip>"; exit 1; }
+	[[ "$1" =~ ^(127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|0\.)|^::1$|^::ffff:127\. ]] && { echo "refusing to ban local or private address $1, it would cut every client"; exit 1; }
 	ufw insert 1 deny from "$1" 2>/dev/null || ufw deny from "$1"
 	echo "banned $1"
 }
@@ -239,6 +297,210 @@ cmd_subpage() {
 	echo "undo: mv /var/www/subpage/index.html.prev /var/www/subpage/index.html"
 }
 
+cmd_why() {
+	local d="$1" e="$2" agh access
+	[[ -n "$d" ]] || { echo "usage: xui-tools why <domain> [email]"; exit 1; }
+	access=$(jq -r '.log.access // "none"' "$XCONF" 2>/dev/null)
+	echo "== server -> https://$d"
+	curl -s -o /dev/null --max-time 10 -w '  http %{http_code}, ip %{remote_ip}, %{time_total}s\n' "https://$d" || echo "  server cannot open https://$d"
+	agh=$(awk '/^dns:/{f=1} f&&/^  port:/{print $2; exit}' "$AGH_YAML" 2>/dev/null)
+	if [[ -n "$agh" ]] && command -v dig &>/dev/null; then
+		echo "== AdGuard answer (0.0.0.0 means blocked)"
+		echo "  $(dig @127.0.0.1 -p "$agh" "$d" +short | head -3 | xargs)"
+	fi
+	echo "== xray access log${e:+ for $e}"
+	if [[ "$access" == "none" ]]; then
+		echo "  access log is off, set \"access\" in Xray -> Advanced -> log, restart xray, repeat the test"
+	else
+		grep -F "$d" /var/log/x-ui/access.log 2>/dev/null | { [[ -n "$e" ]] && grep -F "email: $e" || cat; } | tail -n 10 | sed 's/^/  /'
+	fi
+	echo "== xray errors"
+	grep -F "$d" /var/log/x-ui/3xui.log 2>/dev/null | grep -v X-Forwarded-For | tail -n 10 | sed 's/^/  /'
+}
+
+cmd_alias() {
+	local act="$1" a="$2" pd vh bk map=/etc/nginx/stream-enabled/stream.conf r80=/etc/nginx/sites-available/80.conf sp
+	[[ "$act" == add || "$act" == remove ]] || { echo "usage: xui-tools alias add|remove <extra.domain.tld>"; exit 1; }
+	[[ "$a" =~ ^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$ ]] || { echo "bad domain: $a"; exit 1; }
+	pd=$(panel_domain)
+	vh="/etc/nginx/sites-available/$pd"
+	[[ -n "$pd" && -f "$vh" ]] || { echo "panel vhost not found ($vh)"; exit 1; }
+	[[ "$a" != "$pd" ]] || { echo "$a is already the panel domain"; exit 1; }
+	bk="/root/xui-alias-backup-$(date +%F_%H%M%S)"
+	cp -a /etc/nginx "$bk"
+	if [[ "$act" == remove ]]; then
+		rm -f "/etc/nginx/sites-available/$a" "/etc/nginx/sites-enabled/$a"
+		sed -i "/^\s*${a//./\\.}\s\+www;/d" "$map"
+		A=" $a" perl -pi -e 's/\Q$ENV{A}\E(?=[ ;])//' "$r80"
+	else
+		if [[ ! -f "/etc/letsencrypt/live/$a/fullchain.pem" ]]; then
+			echo "issuing cert for $a, nginx stops for a few seconds (VPN drops)"
+			systemctl stop nginx
+			certbot certonly --standalone --non-interactive --agree-tos --register-unsafely-without-email -d "$a"
+			systemctl start nginx
+			[[ -f "/etc/letsencrypt/live/$a/fullchain.pem" ]] || { echo "cert for $a failed, check that $a points to this server or a relay that forwards port 80"; exit 1; }
+		fi
+		awk '/^server[ \t]*\{/{f=1} f' "$vh" \
+			| OLD="$pd" NEW="$a" perl -pe 's/(?<![\w.-])\Q$ENV{OLD}\E(?![\w-])/$ENV{NEW}/g' > "/etc/nginx/sites-available/$a"
+		ln -sf "/etc/nginx/sites-available/$a" /etc/nginx/sites-enabled/
+		grep -qE "^\s*${a//./\\.}\s+www;" "$map" || sed -i "/^\s*default\s/i\    $a    www;" "$map"
+		grep -qE "server_name[^;]*[[:space:]]${a//./\\.}[ ;]" "$r80" || sed -i "0,/server_name \([^;]*\);/s//server_name \1 $a;/" "$r80"
+	fi
+	if ! nginx -t; then
+		echo "nginx config failed, restoring"
+		rm -rf /etc/nginx && cp -a "$bk" /etc/nginx
+		systemctl restart nginx
+		exit 1
+	fi
+	systemctl reload nginx
+	if [[ "$act" == add ]]; then
+		sp=$(db_setting subPath)
+		echo "alias $a -> same site, panel and subscription as $pd"
+		echo "subscription: https://$a/${sp}/<subId>"
+		echo "panel:        https://$a/$(db_setting webBasePath)/"
+	else
+		echo "alias $a removed, cert kept, delete it with: certbot delete --cert-name $a"
+	fi
+	echo "backup: $bk"
+}
+
+hosts_remove() {
+	local n
+	n=$(sqlite3 "$XUIDB" "DELETE FROM hosts WHERE address = '$1'; SELECT changes();" 2>/dev/null)
+	echo "removed hosts: ${n:-0}"
+	n=$(sqlite3 "$XUIDB" "UPDATE inbounds SET stream_settings = json_set(stream_settings, '\$.externalProxy',
+			(SELECT json_group_array(json(value)) FROM json_each(inbounds.stream_settings, '\$.externalProxy')
+			WHERE json_extract(value, '\$.dest') <> '$1'))
+		WHERE json_type(stream_settings, '\$.externalProxy') = 'array' AND instr(stream_settings, '\"$1\"') > 0;
+		SELECT changes();")
+	echo "cleaned externalProxy in inbounds: $n"
+}
+
+hosts_show() {
+	sqlite3 -header -column "$XUIDB" "SELECT h.id, i.remark AS inbound, h.remark, h.address, h.port, h.security, h.sni FROM hosts h JOIN inbounds i ON i.id = h.inbound_id ORDER BY h.inbound_id, h.id;" 2>/dev/null
+}
+
+cmd_relay() {
+	local act="$1" ip="$2" bk sel col cols n is_dom
+	[[ "$act" == add || "$act" == remove ]] || { echo "usage: xui-tools relay add|remove <relay-ip>"; exit 1; }
+	[[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || { echo "bad IPv4: $ip"; exit 1; }
+	bk="${XUIDB}.bak-relay-$(date +%F_%H%M%S)"
+	cp -a "$XUIDB" "$bk"
+	systemctl stop x-ui
+	is_dom="address NOT LIKE '%:%' AND address GLOB '*[A-Za-z]*'"
+	if [[ "$act" == remove ]]; then
+		hosts_remove "$ip"
+	elif [[ -n "$(sqlite3 "$XUIDB" "SELECT 1 FROM hosts LIMIT 1;" 2>/dev/null)" ]]; then
+		sel=""
+		cols=$(sqlite3 "$XUIDB" "SELECT name FROM pragma_table_info('hosts') WHERE name <> 'id';")
+		for col in $cols; do
+			case "$col" in
+				address) sel+="'$ip'," ;;
+				remark) sel+="coalesce(remark, '') || '-relay'," ;;
+				sni|host_header) sel+="CASE WHEN coalesce($col, '') = '' AND security = 'tls' AND $is_dom THEN address ELSE $col END," ;;
+				group_id) sel+="lower(hex(randomblob(8)))," ;;
+				*) sel+="\"$col\"," ;;
+			esac
+		done
+		n=$(sqlite3 "$XUIDB" "INSERT INTO hosts ($(echo $cols | sed 's/\([^ ]*\)/"\1"/g; s/ /,/g')) SELECT ${sel%,} FROM hosts h
+			WHERE coalesce(h.remark, '') NOT LIKE '%-cfip' AND coalesce(h.remark, '') NOT LIKE '%-relay'
+			AND NOT EXISTS (SELECT 1 FROM hosts x WHERE x.inbound_id = h.inbound_id AND x.address = '$ip');
+			SELECT changes();")
+		echo "added hosts: $n"
+	else
+		n=$(sqlite3 "$XUIDB" "UPDATE inbounds SET stream_settings = json_insert(stream_settings, '\$.externalProxy[#]', json(
+				CASE WHEN json_extract(stream_settings, '\$.externalProxy[0].forceTls') = 'tls'
+				THEN json_set(json_extract(stream_settings, '\$.externalProxy[0]'), '\$.dest', '$ip', '\$.remark', 'relay',
+					'\$.sni', json_extract(stream_settings, '\$.externalProxy[0].dest'))
+				ELSE json_set(json_extract(stream_settings, '\$.externalProxy[0]'), '\$.dest', '$ip', '\$.remark', 'relay') END))
+			WHERE json_type(stream_settings, '\$.externalProxy[0]') = 'object'
+			AND instr(stream_settings, '\"$ip\"') = 0;
+			SELECT changes();")
+		echo "no hosts table rows, added to externalProxy of inbounds: $n"
+	fi
+	systemctl start x-ui
+	hosts_show
+	echo "backup: $bk"
+	echo "undo: systemctl stop x-ui; cp $bk $XUIDB; systemctl start x-ui"
+}
+
+cmd_cfip() {
+	local act="$1" ip="$2" d="${3:-$(panel_domain)}" bk sel col cols n
+	[[ "$act" == add || "$act" == remove ]] || { echo "usage: xui-tools cfip add|remove <cloudflare-ip> [domain]"; exit 1; }
+	[[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || { echo "bad IPv4: $ip"; exit 1; }
+	[[ "$act" == remove || "$d" =~ ^[A-Za-z0-9.-]+$ ]] || { echo "cannot detect panel domain, pass it as 3rd argument"; exit 1; }
+	bk="${XUIDB}.bak-cfip-$(date +%F_%H%M%S)"
+	cp -a "$XUIDB" "$bk"
+	systemctl stop x-ui
+	if [[ "$act" == remove ]]; then
+		hosts_remove "$ip"
+	elif [[ -n "$(sqlite3 "$XUIDB" "SELECT 1 FROM hosts WHERE security = 'tls' AND address = '$d' LIMIT 1;" 2>/dev/null)" ]]; then
+		sel=""
+		cols=$(sqlite3 "$XUIDB" "SELECT name FROM pragma_table_info('hosts') WHERE name <> 'id';")
+		for col in $cols; do
+			case "$col" in
+				address) sel+="'$ip'," ;;
+				remark) sel+="remark || '-cfip'," ;;
+				sni|host_header) sel+="'$d'," ;;
+				group_id) sel+="lower(hex(randomblob(8)))," ;;
+				*) sel+="\"$col\"," ;;
+			esac
+		done
+		n=$(sqlite3 "$XUIDB" "INSERT INTO hosts ($(echo $cols | sed 's/\([^ ]*\)/"\1"/g; s/ /,/g')) SELECT ${sel%,} FROM hosts h
+			WHERE h.security = 'tls' AND h.address = '$d'
+			AND NOT EXISTS (SELECT 1 FROM hosts x WHERE x.inbound_id = h.inbound_id AND x.address = '$ip');
+			SELECT changes();")
+		echo "added hosts: $n"
+	else
+		n=$(sqlite3 "$XUIDB" "UPDATE inbounds SET stream_settings = json_insert(stream_settings, '\$.externalProxy[#]',
+				json_object('forceTls', 'tls', 'dest', '$ip', 'port', 443, 'remark', 'cfip', 'sni', '$d'))
+			WHERE json_extract(stream_settings, '\$.externalProxy[0].dest') = '$d'
+			AND json_extract(stream_settings, '\$.externalProxy[0].forceTls') = 'tls'
+			AND instr(stream_settings, '\"$ip\"') = 0;
+			SELECT changes();")
+		echo "no tls hosts for $d in hosts table, added to externalProxy of inbounds: $n"
+	fi
+	systemctl start x-ui
+	hosts_show
+	echo "backup: $bk"
+	echo "undo: systemctl stop x-ui; cp $bk $XUIDB; systemctl start x-ui"
+}
+
+tls_probe() {
+	timeout 6 openssl s_client -connect "$1" -servername "$2" </dev/null 2>&1 \
+		| grep -E '^CONNECTED|subject=|Verify return code|errno|error' | head -4 | sed 's/^/    /'
+	[[ ${PIPESTATUS[0]} -eq 124 ]] && echo "    TIMEOUT"
+}
+
+cmd_diag() {
+	local out rd pd since p
+	out="/root/xui-diag-$(date +%F_%H%M%S).txt"
+	pd=$(panel_domain)
+	rd=$(awk '/server_name/{print $2; exit}' $(grep -l 'listen 9443' /etc/nginx/sites-enabled/* 2>/dev/null | head -1) 2>/dev/null | tr -d ';')
+	since=$(date -d '-5 min' '+%Y/%m/%d %H:%M')
+	{
+		echo "== time"; date
+		echo "== listening"; ss -ltnup | grep -E ':(443|7443|8443|9443) ' | awk '{print $1, $5, $7}'
+		echo "== tcp states per port"
+		for p in 443 7443 8443 9443; do
+			echo "  $p: $(ss -Htan "( sport = :$p or dport = :$p )" | awk '{print $1}' | sort | uniq -c | xargs)"
+		done
+		echo "== nginx workers"
+		for p in $(pgrep -f 'nginx: worker'); do
+			echo "  pid $p cpu $(ps -o %cpu= -p "$p" | xargs)% fds $(ls /proc/"$p"/fd 2>/dev/null | wc -l) state $(awk '{print $3}' /proc/"$p"/stat)"
+		done
+		echo "== xray"; ps -o pid=,lstart=,%cpu=,rss= -p "$(pgrep -f xray-linux | head -1)"
+		echo "== tls 9443 direct, nginx REALITY target ($rd)"; tls_probe 127.0.0.1:9443 "$rd"
+		echo "== tls 443 with REALITY sni, nginx stream -> xray -> 9443"; tls_probe 127.0.0.1:443 "$rd"
+		echo "== tls 443 with panel sni, nginx stream -> 7443 ($pd)"; tls_probe 127.0.0.1:443 "$pd"
+		echo "== nginx errors since $since"
+		awk -v s="$since" 'substr($0, 1, 16) >= s' /var/log/nginx/error.log \
+			| sed -E 's/^.{20}//; s/\*[0-9]+ //; s/client: [^,]+,//' | cut -c1-110 | sort | uniq -c | sort -rn | head -15
+	} 2>&1 | tee "$out"
+	echo
+	echo "saved: $out"
+}
+
 cmd_health() {
 	for s in x-ui nginx AdGuardHome mtr-backend; do
 		systemctl cat "${s}.service" &>/dev/null || continue
@@ -282,9 +544,15 @@ case "$1" in
 	backup) cmd_backup ;;
 	ban) shift; cmd_ban "$@" ;;
 	unban) shift; cmd_unban "$@" ;;
+	autoban) shift; cmd_autoban "$@" ;;
 	cert) shift; cmd_cert "$@" ;;
 	site) shift; cmd_site "$@" ;;
 	subpage) shift; cmd_subpage "$@" ;;
+	diag) cmd_diag ;;
+	why) shift; cmd_why "$@" ;;
+	cfip) shift; cmd_cfip "$@" ;;
+	relay) shift; cmd_relay "$@" ;;
+	alias) shift; cmd_alias "$@" ;;
 	health) cmd_health ;;
 	dns) shift; cmd_dns "$@" ;;
 	*)
@@ -301,9 +569,15 @@ case "$1" in
 		echo "  backup         tar of db, nginx, certs, AdGuard, history to /root/xui-backups (keeps last 7)"
 		echo "  ban <ip>       block an IP with ufw"
 		echo "  unban <ip>     remove that ufw block"
+		echo "  autoban [on|off|test]  fail2ban: ban IPs with many 404/444 (scanners), VPN paths and Cloudflare ignored"
 		echo "  cert [force]   renew certificates now (stops nginx briefly); 'force' reissues even if not due"
 		echo "  site [1-50]    replace fake cover site, random if no number, previous kept in /var/www/html.prev"
 		echo "  subpage [0|1]  reinstall web sub page (0 modern, 1 classical) with paths from panel and nginx"
+		echo "  alias add|remove <domain>  extra name for the panel site and subscription, e.g. a subdomain pointing to a relay"
+		echo "  relay add|remove <ip>  copy every host (REALITY, ws, gRPC, xhttp, hysteria) with a relay server IP as address (-relay links)"
+		echo "  cfip add|remove <ip> [domain]  copy tls hosts of the panel domain with a Cloudflare IP as address (-cfip links)"
+		echo "  why <domain> [email]  why a site does not open: server reach, AdGuard, xray log lines"
+		echo "  diag           snapshot when VPN breaks: ports, nginx workers, TLS checks of 9443/443, recent nginx errors, saved to /root"
 		echo "  health         services, nginx config, certificates, disk, memory"
 		echo "  dns [domains]  AdGuard answer and lookup time, 0.0.0.0 means blocked"
 		;;
